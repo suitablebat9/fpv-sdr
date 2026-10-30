@@ -173,3 +173,20 @@ Remaining limits:
   A clean installation still needs compatible libiio, libad9361-iio and SoapyPlutoSDR.
 - Local binaries, build caches, recordings, scan logs and machine-specific Desktop files
   are not distributed in the fork.
+
+## Follow-up: intermittent viewer acquisition
+
+A scan could confirm NTSC and then the newly opened viewer could reject its first short
+capture, even though a second attempt worked. Viewer acquisition now keeps one receiver
+stream running and checks up to three fresh capture windows, within a five-second capture
+budget. This allows additional tuner/AGC settling without restarting the source for each
+attempt. It still rejects persistent no-sync input and reports stream stalls as errors.
+The log alone does not establish that settling was the cause of the reported failure.
+`test_acquisition_startup.py` exercises delayed synthetic NTSC/PAL and persistent no-sync;
+physical-camera verification remains outstanding.
+
+If a session reports `hardware AGC` and `auto-video`, it is using automatic picture control.
+For the fixed AKK settings on USB, restart the scanner, enter `picture akk`, then `set A1`.
+Nearby B8 (5866 MHz) may also decode an A1 (5865 MHz) transmission; the scanner accepts the
+first sync-valid channel by RF ranking and does not identify the transmitter's configured
+channel label.

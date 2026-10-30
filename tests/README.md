@@ -107,3 +107,6 @@ bash tests/test_bands.sh
 `test_picture_profiles.py` checks the AKK and auto viewer arguments without hardware;
 `test_scanner_errors.py` checks detector exit-status handling. Existing PAL decode,
 viewer loopback and sync-tuner tests remain part of the suite. These regressions do not establish on-air quality or fresh-install compatibility.
+
+`test_acquisition_startup.py` runs paced synthetic FM with a startup interval without video,
+checks recovery for NTSC/PAL without restarting the receiver, and rejects persistent no-sync.

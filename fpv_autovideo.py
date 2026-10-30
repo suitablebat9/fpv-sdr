@@ -39,25 +39,25 @@ def acquire_video(source, rate, contrast=1., dcblock=False, if_offset=0.):
     analysis_rate = rate/decimation
     chain.append(filter.fir_filter_fff(decimation, firdes.low_pass(
         1., rate, min(350e3, analysis_rate*.35), min(100e3, analysis_rate*.1), window.WIN_HAMMING)))
-    count = int(analysis_rate*.35)
-    head = blocks.head(gr.sizeof_float, count)
-    sink = blocks.vector_sink_f()
-    chain += [head, sink]
+    probe = video_probe(analysis_rate)
+    chain.append(probe)
     tb.connect(*chain)
-    start = time.monotonic()
+    deadline = time.monotonic() + 5
     try:
         tb.start()
-        while len(sink.data()) < count and time.monotonic()-start < 5:
-            time.sleep(.05)
+        for attempt in range(3):
+            # Keep the receiver streaming so tuner/AGC settling is not restarted.
+            estimate = probe.capture(timeout=max(.001, deadline-time.monotonic()))
+            if estimate is not None:
+                return estimate
+            if attempt < 2:
+                sys.stderr.write('[video] Sync not stable yet; checking fresh samples (%d/3)...\n' %
+                                 (attempt+2))
+        return None
     finally:
         tb.stop()
         tb.wait()
-        data = np.asarray(sink.data(), dtype=np.float32)
         tb.disconnect_all()
-    if len(data) < count:
-        raise RuntimeError('radio did not deliver enough samples for video acquisition')
-    # Ignore initial tuner/filter/AGC settling.
-    return estimate_video(data[int(.08*analysis_rate):], analysis_rate)
 
 
 class adaptive_video(gr.sync_block):
