@@ -9,6 +9,8 @@ Receive and decode analog **1.2GHz & 5.8 GHz FPV video** with common software-de
 
 </div>
 
+This is a fork of [lukeswitz/fpv-sdr](https://github.com/lukeswitz/fpv-sdr), with Pluto/macOS fixes, sync-based scanning, improved grayscale decoding and selectable picture profiles. See the [complete fork change guide](docs/FORK_CHANGES.md) for additions, usage, upgrade instructions and validation limits.
+
 
 - [What you need](#what-you-need)
 - [Install](#install)
@@ -70,7 +72,7 @@ cd fpv-sdr
 ```bash
 ./fpv_scanner.sh                 # detects the attached radio
 ./fpv_scanner.sh --sdr hackrf    # or uhd / bladerf / pluto, to skip detection
-./fpv_scanner.sh --standard pal  # PAL camera (625/50); default is NTSC
+./fpv_scanner.sh --standard pal  # force PAL; default is automatic NTSC/PAL detection
 ```
 
 
@@ -83,16 +85,58 @@ cd fpv-sdr
 | `set <CH>` / `freq <MHz>` | tune + view a channel (`set R6`) or frequency (`freq 5843`) |
 | `sdr <name>` | switch radio (`uhd`, `hackrf`, `bladerf`, `pluto`) — detected at startup |
 | `gain <dB>` / `lna <dB>` / `vga <dB>` | fixed RX gain, used when AGC is off (HackRF 24; `gain` sets both LNA+VGA) |
-| `agc <on\|off\|dBFS>` | auto RX gain — tracks LNA/VGA to hold the ADC level (**on by default**, target −20 dBFS; `agc off` pins a fixed gain) |
+| `agc <on\|off\|dBFS>` | auto RX gain — hardware AGC where supported; HackRF tracks LNA/VGA to hold the ADC level (**on by default**, target −20 dBFS; `agc off` pins a fixed gain) |
 | `samp-rate <Msps>` | capture bandwidth — auto per SDR; raise/lower if needed (`samp-rate 14`) |
 | `margin <dB>` | how far over the noise floor counts as a signal (default 12) |
 | `rotate` / `contrast` / `record <file>` | adjust + capture video |
-| `standard <ntsc\|pal>` (or `pal` / `ntsc`) | switch video standard — `pal` = 625/50, 360×288 (EU cameras); default `ntsc` |
+| `standard <auto\|ntsc\|pal>` (or `pal` / `ntsc`) | switch video standard — `pal` = 625/50, 360×288 (EU cameras); default `auto` |
 | `band <58\|12>` | scan band: 5.x GHz (default) or 1.2/1.3 GHz long-range — fit the matching antenna |
 | `list` / `log` / `stop` / `quit` | channels / history / stop / exit |
 
 
-> Default is NTSC; use `--standard pal` (or type `pal` at the prompt) for 625/50 PAL cameras. 
+> Default is automatic NTSC/PAL detection and video-level calibration. Acquisition requires
+> periodic sync pulses; a strong RF carrier alone is not accepted as video. Explicit
+> `--sync-mid`, `--video-offset`, or `--manual-video` retains manual level control.
+
+### Automatic analog camera support
+
+The viewer measures sync pulses, picture levels, FM polarity, line timing and, when available,
+field timing before opening the picture. It chooses NTSC (360×240) or PAL (360×288), then
+cautiously tracks level changes while receiving. Offset/deviation changes are normalized in
+baseband; this does not recover a signal outside the tuned RF passband. If the camera changes
+standard while viewing, close the viewer and tune again to reacquire. Manual standard selection
+is always honored. `agc on` uses receiver hardware AGC where supported; HackRF retains its
+software LNA/VGA controller. Unsupported hardware AGC leaves the requested fixed gain.
+
+On this Mac, **FPV Monitor.command** on the Desktop starts the Pluto Ethernet receiver with
+`picture akk`: fixed gain 15, contrast 1.35 and sync midpoint -0.015, using the previously
+successful camera levels. Scanning and NTSC/PAL detection remain automatic. This avoids
+scene-dependent picture normalization and hardware AGC changing this camera's appearance.
+Use `picture auto` for automatic level calibration and receiver AGC with other cameras;
+`picture akk` restores the preset. These commands apply on the next tune (or reopen the
+last channel). Startup also accepts `--picture auto|akk` or `FPV_PICTURE`.
+Explicit `FPV_VIEW_EXTRA` level overrides still take precedence over picture presets.
+`./start-pluto-manual.command` retains the previously working AKK NTSC profile as a fallback.
+The receiver address is still specific to the local Pluto; another SDR needs its own connection
+and sample-rate settings. To use manual levels from the normal scanner:
+
+```bash
+FPV_VIEW_EXTRA="--manual-video --sync-mid -0.015" ./fpv_scanner.sh --standard ntsc --sdr pluto --dev-args "uri=ip:pluto.local."
+```
+
+`scan` now ranks every distinct channel above the SNR gate and confirms actual
+NTSC/PAL sync at that exact frequency. Strong interference cannot consume a three-candidate
+limit, and duplicate channel aliases are checked once. In automatic mode the narrow-peak
+and envelope-CV heuristics are not rejection gates: wide analog FM can fail those tests.
+A clean scan with no match is reported as no video found; acquisition/device failures remain
+errors. Confirmation can take longer when many channels contain strong signals.
+
+Coverage is common analog FM FPV with standard NTSC/PAL timing, not every possible camera.
+Color remains intentionally unsupported. Digital video, SECAM, nonstandard timing, insufficient
+RF bandwidth, overload, multipath and dropped samples are not solved by calibration. Receiver
+bandwidth defaults remain radio-specific; sustained transport speed is not auto-benchmarked.
+Validation includes synthesized NTSC/PAL, both polarities, changed deviation/offset, noise
+rejection, line jitter and complete-field buffering. More physical cameras/radios still need testing.
 
 
 
@@ -158,8 +202,7 @@ transmitter at 5 ft locked best at 32/32. `agc off` pins the fixed `gain` value 
 - `contrast` scales the demodulated composite onto the levels the decoder expects
 (`BLACK_LEVEL -0.02`, `WHITE_LEVEL 0.06` in `vendor/gr-ntsc-rc/lib/NTSC_configuration.h`). The DC
 offset that keeps the back porch above the decoder's `-0.020` sync threshold is derived from
-`contrast`, so one knob moves both. For a transmitter with very different FM deviation, measure its
-back-porch and sync-tip levels and pass `--sync-mid`.
+`contrast`, so one knob moves both. Automatic mode measures these levels; the controls above are for manual-video mode.
 
 ## Supported radios
 

@@ -37,3 +37,13 @@ git apply /path/to/fpv-sdr/patches/gr-ntsc-rc-pal-support.patch
 rsync -a --exclude='.git' --exclude='build' ./ /path/to/fpv-sdr/vendor/gr-ntsc-rc/
 # then update the pinned commit above
 ```
+
+## Additional fpv-sdr fork changes
+
+The suitablebat9 fork also modifies the decoder and converter for previous-sample safety,
+qualified horizontal/vertical sync and completed-field display buffering. These changes
+are committed directly in `lib/`, not included in the two historical patches above.
+See [the fork change guide](../../docs/FORK_CHANGES.md). The earlier byte-identical NTSC
+statement describes the PAL patch only, not this fork. Re-syncing with the procedure above
+would overwrite these additional changes; preserve/reapply them and run the sync/field
+regressions before replacing the vendored tree. GPLv3 attribution and license are retained.

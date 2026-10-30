@@ -15,7 +15,7 @@ from PIL import Image
 class frame_sink(gr.sync_block):
     def __init__(self, width=360, height=240, out_path=None, every=15,
                  record_path=None, record_fps=30, live=False, title='FPV-SDR',
-                 rotate=0):
+                 rotate=0, live_fps=30):
         gr.sync_block.__init__(self, name='fpv_frame_sink',
                                in_sig=[np.int16], out_sig=[])
         self.w = int(width)
@@ -48,7 +48,7 @@ class frame_sink(gr.sync_block):
                 ['ffplay', '-hide_banner', '-loglevel', 'error', '-nostats', '-autoexit',
                  '-fflags', 'nobuffer', '-flags', 'low_delay',
                  '-f', 'rawvideo', '-pixel_format', 'gray', '-video_size', size,
-                 '-framerate', '30', '-window_title', title,
+                 '-framerate', str(live_fps), '-framedrop', '-window_title', title,
                  '-x', str(ow * 2), '-y', str(oh * 2), '-i', '-'],
                 stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
             sys.stderr.write("[fpv] live window (ffplay)\n")

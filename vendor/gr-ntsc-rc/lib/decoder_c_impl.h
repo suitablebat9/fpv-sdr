@@ -24,6 +24,9 @@ namespace gr {
      /*------------------ GLOBAL VAR DEFINITION -------------*/
      private:
       float d_samp_rate;
+      float d_previous_sample;
+      int d_sync_low_samples;
+      int d_hsync_age;
       float d_samples_cnt;
       float d_lines_cnt;
       int d_state;

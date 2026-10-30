@@ -60,12 +60,50 @@ right antenna on the RX port.
 1. With **no VTX powered**, run `scan` → expect per-channel dBFS/SNR lines and `No FPV signals`,
    and no window opens.
 2. Power a VTX on a known channel (e.g. A8 = 5725), run `scan` → expect `[SIGNAL] A8 found …` and
-   the viewer opens on that channel. An off-frequency VTX maps to the nearest channel, offset shown.
+   the viewer opens on that channel. Sync mode checks the listed channel frequency; legacy localization modes can report offsets.
 3. With busy 5 GHz Wi-Fi near the antenna and no VTX, run `scan` → expect it rejects the Wi-Fi
    (`No FPV signals`).
 4. Run `sweep` → expect a per-channel RSSI/SNR table, no video.
 5. Run `spectrum` (or `spectrum A8`) → expect a peak at the VTX center.
 6. Run `set A8` (or `freq 5725`) → expect the viewer to tune and open (an `ffplay` window on macOS/brew).
 
-Knobs if a live TX is missed or noise sneaks through: `margin <dB>`, `--env-cv <x>`, `gain <dB>`
+Knobs if a live TX is missed or noise sneaks through: `margin <dB>`, `gain <dB>` (the detector option `--env-cv` only applies to legacy CV confirmation)
 (lower if the floor sits near −10…−20 dBFS = clipping). See the main README **Troubleshooting**.
+
+## Automatic analog-video tests
+
+After sourcing `fpv_env.sh` and calling `resolve_fpv_python`, use the resolved
+`$PYTHON` to run `tests/test_video_acquisition.py`, `tests/test_video_tracking.py`,
+and `tests/test_auto_viewer.py`. These tests use synthesized signals, not hardware.
+They cover NTSC/PAL recognition, normal/inverted FM, amplitude and frequency-offset
+changes, rejection of noise/silence/tones, ongoing level tracking, format-change
+protection, unsupported hardware AGC, and complete FM-to-picture decoding.
+`test_horizontal_sync.py`, `test_vertical_sync.py`, and `test_frame_coherence.py`
+cover synchronization and intact displayed fields. Live compatibility with multiple
+physical cameras and transports remains a separate validation step.
+
+Scanner regressions: `test_scan_selection.py` reproduces a weaker A1 signal behind
+stronger non-video candidates, duplicate frequencies, a failed narrow-peak heuristic,
+forced video standards, no-hit results and genuine device errors. `test_scan_probe.py`
+checks that each channel confirmation captures fresh samples and reports stream stalls.
+
+
+## Fork regression suite (offline)
+
+Use Bash 4+ (Homebrew Bash on macOS) from the repository root. Rebuild the bundled decoder
+first if upgrading from the original: `FPV_REBUILD_DECODER=1 ./setup.sh`.
+
+```bash
+source fpv_env.sh
+resolve_fpv_python
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+for test in tests/test_*.py; do
+    "$PYTHON" "$test" || break
+done
+bash tests/test_bands.sh
+```
+
+`test_scan_flowgraph.py` exercises real GNU Radio confirmation with synthetic FM;
+`test_picture_profiles.py` checks the AKK and auto viewer arguments without hardware;
+`test_scanner_errors.py` checks detector exit-status handling. Existing PAL decode,
+viewer loopback and sync-tuner tests remain part of the suite. These regressions do not establish on-air quality or fresh-install compatibility.

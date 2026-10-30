@@ -5,6 +5,15 @@
 import sys
 import math
 
+# On macOS, load UHD before gr-blocks: their exported Boost.Asio symbols
+# can collide, crashing UHD's network discovery when gr-blocks loads first.
+# UHD is optional for Soapy-only installations.
+if sys.platform == 'darwin':
+    try:
+        from gnuradio import uhd as _uhd_preload
+    except ImportError:
+        pass
+
 UHD_ALIASES = ('uhd', 'antsdr', 'usrp', 'b200', 'b210', 'b200mini')
 
 SOAPY_DRIVERS = {'pluto': 'plutosdr'}
@@ -26,7 +35,17 @@ def list_sdrs():
             if drv:
                 found.append(drv)
     except ImportError:
-        pass
+        # GNU Radio's C++ Soapy backend can work without Python Soapy bindings.
+        try:
+            out = subprocess.run(['SoapySDRUtil', '--find'], capture_output=True,
+                                 text=True, timeout=15)
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    key, sep, value = line.strip().partition('=')
+                    if sep and key.strip() == 'driver' and value.strip():
+                        found.append(value.strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
     except RuntimeError as e:
         sys.stderr.write("[fpv] SoapySDR enumeration failed: %s\n" % e)
     if 'uhd' not in found:

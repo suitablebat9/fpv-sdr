@@ -59,6 +59,9 @@ namespace gr {
     {
       /*** INIT ***/
       d_samp_rate = samp_rate;
+      d_previous_sample = 0.0f;
+      d_sync_low_samples = 0;
+      d_hsync_age = int(2 * 64.0e-6 * samp_rate);
       d_state = IDLE;
       d_samples_cnt = 0;
       d_lines_cnt = 0;
@@ -93,6 +96,31 @@ namespace gr {
 
       for(int i = 0; i < noutput_items; i++){
         d_samples_cnt++;
+        // Qualify sync by pulse width, and rephase each line at the
+        // trailing edge. Fixed-duration free-running lines accumulate error.
+        const int previous_low = d_sync_low_samples;
+        if (d_hsync_age < int(2 * d_vs.line_dur * d_samp_rate))
+          ++d_hsync_age;
+        if (in[i] < HORIZONTAL_SYNC_THRESHOLD) {
+          if (d_sync_low_samples <= int(30.0e-6 * d_samp_rate))
+            ++d_sync_low_samples;
+        } else {
+          d_sync_low_samples = 0;
+          if (previous_low >= int(3.0e-6 * d_samp_rate) &&
+              previous_low <= int(7.0e-6 * d_samp_rate) &&
+              d_hsync_age >= int(0.90 * d_vs.line_dur * d_samp_rate) &&
+              d_state != VERTICAL_SYNC) {
+            if (d_state == VIDEO && d_samples_cnt > 0.75 * d_vs.video_dur * d_samp_rate)
+              ++d_lines_cnt;
+            d_state = BACK_PORCH;
+            d_samples_cnt = 0;
+            d_hsync_age = 0;
+          }
+        }
+        if (d_sync_low_samples == int(12.0e-6 * d_samp_rate) && d_state != VERTICAL_SYNC) {
+          d_state = VERTICAL_SYNC;
+          d_samples_cnt = 0;
+        }
         out1[i] = -1; // -1 = defined if d_state = VIDEO
         out2[i] = -1;
         out3[i] = -1;
@@ -106,7 +134,7 @@ namespace gr {
             out[i] =  IDLE;
 
             // Level of Horizontal Sync
-            if(in[i-1] > HORIZONTAL_SYNC_THRESHOLD and in[i] < HORIZONTAL_SYNC_THRESHOLD){
+            if((i > 0 ? in[i-1] : d_previous_sample) > HORIZONTAL_SYNC_THRESHOLD and in[i] < HORIZONTAL_SYNC_THRESHOLD){
               d_state = HORIZONTAL_SYNC;
               d_samples_cnt = 0;
             }
@@ -153,23 +181,13 @@ namespace gr {
               d_lines_cnt++;
             }
 
-            // Level and Time for Vertical Sync
-            if(in[i-1] > HORIZONTAL_SYNC_THRESHOLD  && in[i] < HORIZONTAL_SYNC_THRESHOLD && d_samples_cnt < 0.75 * d_vs.video_dur * d_samp_rate){
-              d_state = VERTICAL_SYNC;
-              d_samples_cnt = 0;
-            }
+
           }
 
 
           /*** FRONT PORCH ***/
           if(d_state == FRONT_PORCH){
             out[i] =  FRONT_PORCH;
-
-            // Level of Sync Tip
-            if(in[i-1] > HORIZONTAL_SYNC_THRESHOLD and in[i] < HORIZONTAL_SYNC_THRESHOLD){
-              d_state = HORIZONTAL_SYNC;
-              d_samples_cnt = 0;
-            }
 
             // Time for horizontal sync
             if(d_samples_cnt > d_vs.front_porch_dur * d_samp_rate){
@@ -193,6 +211,8 @@ namespace gr {
 
 
       }
+      if (noutput_items > 0)
+        d_previous_sample = in[noutput_items - 1];
       return noutput_items;
     }
   } /* namespace NTSC */

@@ -12,6 +12,8 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from fpv_sdr import build_source, quad_demod_gain, UHD_ALIASES
+
 from gnuradio import gr, analog, blocks, filter
 from gnuradio.filter import firdes
 from gnuradio.fft import window
@@ -30,8 +32,8 @@ except Exception:
     video_sdl = None
     HAVE_SDL = False
 
-from fpv_sdr import build_source, quad_demod_gain, UHD_ALIASES
 from fpv_display import frame_sink
+from fpv_autovideo import acquire_video, adaptive_video, receiver_agc
 
 LOCK_FULL = 5.0
 
@@ -52,17 +54,13 @@ def split_gain(total, lna_max=32.0):
 class viewer(gr.top_block):
     def __init__(self, sdr, samp_rate, freq, gain, dev_args, antenna,
                  frame_out='/tmp/fpv_frame.png', record_path=None, live=True, dcblock=True,
-                 rotate=0, oversample=2, contrast=1.0, lna=None, vga=None, amp=False,
+                 rotate=0, oversample=1, contrast=1.0, lna=None, vga=None, amp=False,
                  standard='ntsc', display='auto', video_offset=None, video_bw=1.25e6,
                  sync_mid=SYNC_MID, agc=False, agc_target=-20.0, agc_lna_max=32.0,
-                 if_offset=0.0):
+                 if_offset=0.0, auto_video=False):
         gr.top_block.__init__(self, "FPV Viewer", catch_exceptions=True)
         self.samp_rate = samp_rate
         self.frequency_carrier = freq
-
-        is_pal = str(standard).lower() == 'pal'
-        self.vid_w, self.vid_h, field_rate, std_code = (
-            (360, 288, 50, 1) if is_pal else (360, 240, 60, 0))
 
         oversample = max(1, int(oversample))
         self.cap_rate = cap_rate = samp_rate * oversample
@@ -73,6 +71,34 @@ class viewer(gr.top_block):
         self.src, self._retune = build_source(
             cap_rate, freq + self.if_offset, gain, sdr=sdr, dev_args=dev_args,
             antenna=antenna, lna=lna, vga=vga, amp=amp)
+
+        self.hardware_agc = bool(agc) and receiver_agc(self.src, sdr)
+        if self.hardware_agc:
+            sys.stderr.write('[video] Receiver hardware AGC enabled.\n')
+        elif agc and sdr.lower() != 'hackrf':
+            sys.stderr.write('[video] Hardware AGC unavailable; retaining the requested gain.\n')
+        self.auto_video = None
+        estimate = None
+        if auto_video or standard == 'auto':
+            sys.stderr.write('[video] Acquiring sync, video levels and NTSC/PAL timing...\n')
+            estimate = acquire_video(self.src, cap_rate, contrast,
+                                     dcblock=dcblock and sdr.lower() not in UHD_ALIASES,
+                                     if_offset=self.if_offset)
+            if estimate is None:
+                raise RuntimeError('No reliable analog video sync found. Check the channel/signal, '
+                                   'or select --standard ntsc|pal --manual-video for manual tuning.')
+            if standard == 'auto':
+                standard = estimate.standard
+            elif standard != estimate.standard:
+                sys.stderr.write('[video] Signal looks like %s; honoring forced %s.\n' %
+                                 (estimate.standard.upper(), standard.upper()))
+            sys.stderr.write('[video] %s: line %.3f us, sync confidence %.0f%%, polarity %s.\n' %
+                             (standard.upper(), estimate.line_us, estimate.confidence*100,
+                              'normal' if estimate.scale > 0 else 'inverted'))
+        self.standard = standard
+        is_pal = str(standard).lower() == 'pal'
+        self.vid_w, self.vid_h, field_rate, std_code = (
+            (360, 288, 50, 1) if is_pal else (360, 240, 60, 0))
 
         title = 'FPV-SDR %.0f MHz' % (freq / 1e6)
         self.low_pass_filter_1 = filter.fir_filter_fff(
@@ -101,11 +127,23 @@ class viewer(gr.top_block):
         self.video_offset = (level_offset(contrast, self.sync_mid)
                              if video_offset is None else float(video_offset))
         self.video_level = blocks.add_const_ff(self.video_offset)
-        self.connect((self.low_pass_filter_1, 0), self.video_level)
+        if auto_video and estimate is not None:
+            # Keep a forced standard in manual override mode.
+            from dataclasses import replace
+            self.auto_video = adaptive_video(samp_rate, replace(estimate, standard=standard))
+            self.video_offset = 0.0
+            self.video_level.set_k(0.0)
+            self.connect(self.low_pass_filter_1, self.auto_video, self.video_level)
+        else:
+            self.connect((self.low_pass_filter_1, 0), self.video_level)
         self.connect(self.video_level, (self.NTSC_decoder_c_0, 0))
 
+        # sync_decimator takes an integer factor, so use its actual pixel rate
+        # for playback rather than assuming an exact NTSC/PAL field rate.
+        pixel_decimation = max(1, int(samp_rate / (self.vid_w * self.vid_h * field_rate)))
+        display_fps = samp_rate / pixel_decimation / (self.vid_w * self.vid_h)
         self.NTSC_video_stream_converter_c_0 = NTSC.video_stream_converter_c(
-            samp_rate, samp_rate / (self.vid_w * self.vid_h * field_rate),
+            samp_rate, pixel_decimation,
             self.vid_w, self.vid_h)
         self.connect((self.NTSC_decoder_c_0, 0), (self.NTSC_video_stream_converter_c_0, 0))
         self.connect((self.NTSC_decoder_c_0, 1), (self.NTSC_video_stream_converter_c_0, 1))
@@ -131,7 +169,8 @@ class viewer(gr.top_block):
         self.connect((self.NTSC_decoder_c_0, 0), self.lock_state,
                      self.lock_abs, self.lock_keep, self.lock_avg, self.lock_probe)
 
-        self.agc = bool(agc)
+        # This software AGC controls HackRF-specific LNA/VGA gain stages.
+        self.agc = bool(agc) and sdr.lower() == 'hackrf'
         self.agc_target = float(agc_target)
         self.agc_lna_max = float(agc_lna_max)
         self.agc_total = float(gain if lna is None else lna) + float(gain if vga is None else vga)
@@ -142,7 +181,7 @@ class viewer(gr.top_block):
             try:
                 self.src.set_gain(0, 'LNA', l0)
                 self.src.set_gain(0, 'VGA', v0)
-            except (AttributeError, RuntimeError):
+            except (AttributeError, RuntimeError, ValueError):
                 self.agc = False
         lvl_dec = max(1, int(cap_rate / 100e3))
         self.lvl_mag = blocks.complex_to_mag_squared(1)
@@ -170,7 +209,8 @@ class viewer(gr.top_block):
         else:
             self.frame_sink_0 = frame_sink(
                 self.vid_w, self.vid_h, None if live else frame_out,
-                record_path=record_path, live=live, title=title, rotate=rotate)
+                record_path=record_path, live=live, title=title, rotate=rotate,
+                live_fps=display_fps)
             self.connect((self.sync_delay, 0), (self.frame_sink_0, 0))
 
     def retune(self, freq):
@@ -182,6 +222,8 @@ class viewer(gr.top_block):
         self.set_video_offset(level_offset(contrast, self.sync_mid))
 
     def set_video_offset(self, offset):
+        if self.auto_video is not None:
+            self.auto_video.enabled = False
         self.video_offset = float(offset)
         self.video_level.set_k(self.video_offset)
 
@@ -225,7 +267,7 @@ class viewer(gr.top_block):
             try:
                 self.src.set_gain(0, 'LNA', lna)
                 self.src.set_gain(0, 'VGA', vga)
-            except (AttributeError, RuntimeError):
+            except (AttributeError, RuntimeError, ValueError):
                 self.agc = False
                 return rms
         self.agc_total = total
@@ -317,9 +359,13 @@ def run_sync_tuner(tb):
                 ovf = errlog.read().count(b'sO')
             except OSError:
                 ovf = 0
-            lna, vga = tb.agc_gains()
-            agc = "   rf:%+.0fdBFS%s lna:%d vga:%d" % (
-                rms, " agc" if tb.agc else "", lna, vga)
+            if tb.agc:
+                lna, vga = tb.agc_gains()
+                agc = "   rf:%+.0fdBFS agc lna:%d vga:%d" % (rms, lna, vga)
+            else:
+                agc = "   rf:%+.0fdBFS %s" % (rms, "hardware AGC" if tb.hardware_agc else "fixed gain")
+            if tb.auto_video is not None:
+                agc += " %s auto-video" % tb.standard.upper()
             sys.stdout.write(
                 "\r[sync] V:%+4d lines  H:%+4d px   lock:%3d%%   ovf:%d%s\x1b[K" %
                 (v, h, tb.lock_pct(), ovf, agc))
@@ -365,15 +411,17 @@ def main():
                     help='scale the demodulated composite onto the decoder black/white window')
     ap.add_argument('--video-offset', type=float, default=None,
                     help='DC shift applied after --contrast; derived from --sync-mid when unset')
-    ap.add_argument('--sync-mid', type=float, default=SYNC_MID,
+    ap.add_argument('--sync-mid', type=float, default=None,
                     help='demodulated level midway between back porch and sync tip at '
                          'contrast 1.0; the offset keeps the decoder threshold there')
     ap.add_argument('--video-bw', type=float, default=1.25e6,
                     help='baseband low-pass cutoff feeding the decoder; gr-ntsc-rc documents '
                          '1.25 MHz, wider passes more detail and more sync-edge noise')
-    ap.add_argument('--standard', choices=('ntsc', 'pal'), default='ntsc',
-                    help='analog video standard: ntsc (525/60, 360x240, default) or '
+    ap.add_argument('--standard', choices=('auto', 'ntsc', 'pal'), default='auto',
+                    help='auto detects timing; ntsc (525/60, 360x240) or '
                          'pal (625/50, 360x288 — common on EU FPV cameras)')
+    ap.add_argument('--manual-video', action='store_true',
+                    help='disable automatic video-level calibration; use manual sync/contrast/offset')
     ap.add_argument('--display', default=os.environ.get('FPV_DISPLAY', 'auto'),
                     choices=('auto', 'sdl', 'sdl-hw', 'ffplay'),
                     help='live video backend: auto/sdl = gr-video-sdl with a software YUV '
@@ -402,6 +450,9 @@ def main():
             "         It is not part of the DragonOS SDR stack; setup.sh builds it from vendor/.\n")
         sys.exit(2)
 
+    manual_video = args.manual_video or args.sync_mid is not None or args.video_offset is not None
+    # Explicit legacy level controls retain their behavior. Auto standard can
+    # still identify timing without changing the requested video levels.
     tb = viewer(args.sdr, args.samp_rate, args.freq, args.gain,
                 args.dev_args, args.antenna, frame_out=args.frame_out,
                 record_path=args.record, live=(not args.no_window),
@@ -410,8 +461,8 @@ def main():
                 lna=args.lna, vga=args.vga, amp=args.amp,
                 standard=args.standard, display=args.display,
                 video_offset=args.video_offset, video_bw=args.video_bw,
-                sync_mid=args.sync_mid, agc=args.agc, agc_target=args.agc_target,
-                agc_lna_max=args.agc_lna_max, if_offset=args.if_offset)
+                sync_mid=SYNC_MID if args.sync_mid is None else args.sync_mid, agc=args.agc, agc_target=args.agc_target,
+                agc_lna_max=args.agc_lna_max, if_offset=args.if_offset, auto_video=not manual_video)
 
     def sig_handler(sig=None, frame=None):
         tb.stop()
@@ -437,4 +488,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        sys.stderr.write('[viewer] %s\n' % exc)
+        sys.exit(2)

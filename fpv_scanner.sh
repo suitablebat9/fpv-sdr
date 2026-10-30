@@ -29,9 +29,32 @@ DEV_ARGS="${FPV_DEV_ARGS:-}"
 ANTENNA="${FPV_ANTENNA:-}"
 VIEW_EXTRA="${FPV_VIEW_EXTRA:-}"
 RECORD="${FPV_RECORD:-}"
-STANDARD="${FPV_STANDARD:-ntsc}"
-AGC="${FPV_AGC:-1}"
+STANDARD="${FPV_STANDARD:-auto}"
+case "${FPV_AGC:-on}" in
+    off|OFF|0|false) AGC="" ;;
+    *) AGC=1 ;;
+esac
 AGC_TARGET="${FPV_AGC_TARGET:--20}"
+
+PICTURE_PROFILE=auto
+PICTURE_ARGS=()
+
+# Picture presets do not change channel selection or NTSC/PAL detection.
+apply_picture_profile() {
+    case "$1" in
+        akk)
+            PICTURE_ARGS=(--manual-video --sync-mid -0.015)
+            GAIN=15; GAIN_SET=1; AGC=""; CONTRAST=1.35 ;;
+        auto)
+            PICTURE_ARGS=()
+            AGC=1; CONTRAST=1.35 ;;
+        *) echo "[ERROR] Use picture auto|akk" >&2; return 1 ;;
+    esac
+    PICTURE_PROFILE="$1"
+}
+if [[ -n "${FPV_PICTURE:-}" ]]; then
+    apply_picture_profile "$FPV_PICTURE" || exit 2
+fi
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -44,9 +67,10 @@ while [[ $# -gt 0 ]]; do
         --margin) MARGIN="$2"; shift 2 ;;
         --dev-args) DEV_ARGS="$2"; shift 2 ;;
         --antenna) ANTENNA="$2"; shift 2 ;;
+        --picture) apply_picture_profile "$2" || exit 2; shift 2 ;;
         --standard) STANDARD="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: $0 [--sdr uhd|hackrf|bladerf] [--gain N] [--lna N] [--vga N] [--amp] [--samp-rate HZ] [--margin dB] [--dev-args STR] [--antenna NAME] [--standard ntsc|pal]"
+            echo "Usage: $0 [--sdr uhd|hackrf|bladerf] [--gain N] [--lna N] [--vga N] [--amp] [--samp-rate HZ] [--margin dB] [--dev-args STR] [--antenna NAME] [--standard auto|ntsc|pal] [--picture auto|akk]"
             echo "       the radio is detected automatically; --sdr overrides it"
             exit 0 ;;
         *) echo "[WARN] unknown arg: $1"; shift ;;
@@ -190,9 +214,22 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
+check_radio_backend() {
+    local module=soapy
+    case "$SDR" in
+        uhd|antsdr|usrp|b200|b210|b200mini) module=uhd ;;
+    esac
+    if ! "$PYTHON" -c "from gnuradio import $module"; then
+        echo "[ERROR] GNU Radio's $module backend could not load. Repair the GNU Radio/driver installation before scanning or viewing." >&2
+        return 1
+    fi
+}
+
 set_frequency() {
     local freq_mhz=$1
     local channel_name=$2
+
+    check_radio_backend || return 1
 
     release_sdr
 
@@ -206,17 +243,25 @@ set_frequency() {
         ${DEV_ARGS:+--dev-args "$DEV_ARGS"} \
         ${ANTENNA:+--antenna "$ANTENNA"} \
         ${RECORD:+--record "$RECORD"} \
-        ${VIEW_EXTRA}
+        "${PICTURE_ARGS[@]}" ${VIEW_EXTRA}
+    local viewer_status=$?
     TB_INSTANCE=""
+    if [[ $viewer_status -ne 0 ]]; then
+        CURRENT_FREQ=""
+        CURRENT_CHANNEL=""
+        echo "[ERROR] Viewer failed for $channel_name ($freq_mhz MHz), exit status $viewer_status" >&2
+        return "$viewer_status"
+    fi
 
     CURRENT_FREQ=$freq_mhz
     CURRENT_CHANNEL=$channel_name
 
-    echo "[$(date +%H:%M:%S)] Viewing $channel_name ($freq_mhz MHz) [$SDR] - PID: $TB_INSTANCE"
+    echo "[$(date +%H:%M:%S)] Viewer closed for $channel_name ($freq_mhz MHz) [$SDR]"
     echo "$(date +%Y-%m-%d_%H:%M:%S),$channel_name,$freq_mhz" >> "$SCAN_LOG"
 }
 
 scan_channels() {
+    check_radio_backend || return 1
     SCAN_ACTIVE=1
     release_sdr
 
@@ -228,11 +273,12 @@ scan_channels() {
     echo "[INFO] Scanning ${#tokens[@]} channels headless on [$SDR] — no window opens until a signal is found"
     echo "[INFO] (type 'stop' to abort the sweep)"
 
-    local hit_name="" hit_freq="" errf="/tmp/fpv_scan.err"
+    local hit_name="" hit_freq="" errf="/tmp/fpv_scan.err" detector_status=0
     : > "$errf"
     while read -r tag f1 f2 f3 _ f5; do
         [[ $SCAN_ACTIVE -eq 0 ]] && break
         case "$tag" in
+            SCAN_EXIT) detector_status="$f1" ;;
             DETECT)
                 local mhz
                 mhz=$(awk "BEGIN{printf \"%.0f\", $f2/1e6}")
@@ -252,6 +298,7 @@ scan_channels() {
             ${DEV_ARGS:+--dev-args "$DEV_ARGS"} \
             ${ANTENNA:+--antenna "$ANTENNA"} \
             "${tokens[@]}" 2>"$errf"
+        printf "SCAN_EXIT %s\n" "$?"
     )
 
     pkill -TERM -f "fpv_detect.py" >/dev/null 2>&1
@@ -262,6 +309,13 @@ scan_channels() {
     if [[ $SCAN_ACTIVE -eq 0 ]]; then
         echo "[INFO] Scan stopped"
         return
+    fi
+
+    if [[ $detector_status -ne 0 ]]; then
+        echo "[ERROR] Scan failed (exit status $detector_status); no valid scan result." >&2
+        cat "$errf" >&2
+        SCAN_ACTIVE=0
+        return "$detector_status"
     fi
 
     if [[ -n "$hit_name" ]]; then
@@ -277,6 +331,7 @@ scan_channels() {
 }
 
 scan_loop() {
+    check_radio_backend || return 1
     local timeout="${1:-}"
     local gap="${FPV_SCAN_LOOP_GAP:-2}"
     SCAN_ACTIVE=1
@@ -300,7 +355,7 @@ scan_loop() {
 
     trap 'SCAN_LOOP_ABORT=1; SCAN_ACTIVE=0; pkill -TERM -f "fpv_detect.py" >/dev/null 2>&1' INT
 
-    local pass=0 hit_name="" hit_freq=""
+    local pass=0 hit_name="" hit_freq="" detector_status=0 errf="/tmp/fpv_scan_loop.err"
     while [[ $SCAN_ACTIVE -eq 1 && $SCAN_LOOP_ABORT -eq 0 ]]; do
         if [[ $deadline -gt 0 && $(date +%s) -ge $deadline ]]; then
             echo "[INFO] Continuous scan time limit reached"
@@ -308,10 +363,11 @@ scan_loop() {
         fi
         pass=$((pass + 1))
         echo -e "\n[INFO] Sweep pass #$pass (${#tokens[@]} channels)…"
-        hit_name=""; hit_freq=""
+        hit_name=""; hit_freq=""; detector_status=0
         while read -r tag f1 f2 f3 _ f5; do
             [[ $SCAN_ACTIVE -eq 0 || $SCAN_LOOP_ABORT -eq 1 ]] && break
             case "$tag" in
+                SCAN_EXIT) detector_status="$f1" ;;
                 DETECT)
                     local mhz
                     mhz=$(awk "BEGIN{printf \"%.0f\", $f2/1e6}")
@@ -330,11 +386,13 @@ scan_loop() {
                 ${CONFIRM:+--confirm "$CONFIRM"} --standard "$STANDARD" \
                 ${DEV_ARGS:+--dev-args "$DEV_ARGS"} \
                 ${ANTENNA:+--antenna "$ANTENNA"} \
-                "${tokens[@]}" 2>/dev/null
+                "${tokens[@]}" 2>"$errf"
+            printf "SCAN_EXIT %s\n" "$?"
         )
         pkill -TERM -f "fpv_detect.py" >/dev/null 2>&1
         DETECT_PID=""
 
+        [[ $detector_status -ne 0 ]] && break
         [[ -n "$hit_name" ]] && break
         [[ $SCAN_ACTIVE -eq 0 || $SCAN_LOOP_ABORT -eq 1 ]] && break
         if [[ $deadline -gt 0 && $(date +%s) -ge $deadline ]]; then
@@ -350,6 +408,13 @@ scan_loop() {
 
     trap cleanup EXIT INT TERM
     [[ -n "$watchdog" ]] && kill "$watchdog" >/dev/null 2>&1
+
+    if [[ $detector_status -ne 0 && $SCAN_LOOP_ABORT -eq 0 ]]; then
+        echo "[ERROR] Continuous scan failed (exit status $detector_status); no valid scan result." >&2
+        cat "$errf" >&2
+        SCAN_ACTIVE=0
+        return "$detector_status"
+    fi
 
     if [[ -n "$hit_name" ]]; then
         local mhz
@@ -367,6 +432,7 @@ scan_loop() {
 }
 
 sweep_channels() {
+    check_radio_backend || return 1
     release_sdr
     local tokens=() channel
     for channel in "${SCAN_ORDER[@]}"; do
@@ -383,6 +449,13 @@ sweep_channels() {
         "${tokens[@]}" 2>"$errf" \
       | awk '/^DETECT/{printf "  %-5s %4.0f MHz  %7.1f dBFS\n", $2, $3/1e6, $4}' \
       | sort -k4 -nr
+    local detector_status=${PIPESTATUS[0]}
+    if [[ $detector_status -ne 0 ]]; then
+        echo "[ERROR] Sweep failed (exit status $detector_status); no valid scan result." >&2
+        cat "$errf" >&2
+        DETECT_PID=""
+        return "$detector_status"
+    fi
     grep -o "noise floor.*" "$errf" 2>/dev/null | tail -1 | sed 's/^/[INFO] /'
     DETECT_PID=""
 }
@@ -438,7 +511,7 @@ show_menu() {
     echo -e "\n========================================="
     echo "FPV Channel Scanner & Monitor"
     echo "========================================="
-    echo "SDR: $SDR  |  Gain: $GAIN dB${LNA:+  LNA:$LNA}${VGA:+ VGA:$VGA}${AMP:+ AMP:on}  |  Std: ${STANDARD}  |  Current: ${CURRENT_CHANNEL:-none}${CURRENT_FREQ:+ (${CURRENT_FREQ} MHz)}"
+    echo "SDR: $SDR  |  Gain: $GAIN dB${LNA:+  LNA:$LNA}${VGA:+ VGA:$VGA}${AMP:+ AMP:on}  |  Std: ${STANDARD}  |  Picture: ${PICTURE_PROFILE}  |  Current: ${CURRENT_CHANNEL:-none}${CURRENT_FREQ:+ (${CURRENT_FREQ} MHz)}"
     echo ""
     echo "Commands:"
     printf "  %-16s %s\n" \
@@ -459,10 +532,11 @@ show_menu() {
         "margin <dB>"     "detect threshold over floor (def ${MARGIN})" \
         "record <file>"   "record video; bare 'record' = off" \
         "rotate <deg>"    "0|90|180|270 (def ${ROTATE})" \
+        "picture <auto|akk>" "auto calibration or known AKK levels (now ${PICTURE_PROFILE})" \
         "contrast <x>"    "demod contrast (def ${CONTRAST})" \
         "agc <on|off|dBFS>" "auto RX gain (now: $([[ -n "$AGC" ]] && echo "on @ ${AGC_TARGET} dBFS" || echo off))" \
         "samp-rate <Msps>" "capture bandwidth, e.g. 20 or 10 (now ${SAMP_RATE})" \
-        "standard <std>"  "video standard ntsc|pal (def ${STANDARD})" \
+        "standard <std>"  "video standard auto|ntsc|pal (def ${STANDARD})" \
         "log"             "show scan log" \
         "quit"            "exit"
     echo "========================================="
@@ -639,6 +713,14 @@ main() {
                 esac
                 [[ -n "$agc_changed" && -n "$CURRENT_CHANNEL" ]] && set_frequency "$CURRENT_FREQ" "$CURRENT_CHANNEL"
                 ;;
+            picture)
+                if [[ -z "$arg1" ]]; then
+                    echo "[INFO] Picture profile: $PICTURE_PROFILE (use picture auto|akk)"
+                elif apply_picture_profile "$arg1"; then
+                    echo "[INFO] Picture profile: $PICTURE_PROFILE; gain $GAIN, contrast $CONTRAST. Applies on next tune."
+                    [[ -n "$CURRENT_CHANNEL" ]] && set_frequency "$CURRENT_FREQ" "$CURRENT_CHANNEL"
+                fi
+                ;;
             contrast)
                 if [[ "$arg1" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
                     CONTRAST="$arg1"
@@ -652,16 +734,18 @@ main() {
                 local want="$cmd"
                 [[ "$cmd" == "standard" ]] && want="$arg1"
                 case "$want" in
-                    ntsc|pal)
+                    auto|ntsc|pal)
                         STANDARD="$want"
-                        if [[ "$STANDARD" == "pal" ]]; then
+                        if [[ "$STANDARD" == "auto" ]]; then
+                            echo "[INFO] Video standard: automatic NTSC/PAL acquisition on next tune"
+                        elif [[ "$STANDARD" == "pal" ]]; then
                             echo "[INFO] Video standard set to pal (625/50, 360x288) — applies on next tune/scan"
                         else
                             echo "[INFO] Video standard set to ntsc (525/60, 360x240) — applies on next tune/scan"
                         fi
                         [[ -n "$CURRENT_CHANNEL" ]] && set_frequency "$CURRENT_FREQ" "$CURRENT_CHANNEL"
                         ;;
-                    *) echo "[INFO] Current standard: ${STANDARD} (use: standard ntsc|pal, or 'pal'/'ntsc')" ;;
+                    *) echo "[INFO] Current standard: ${STANDARD} (use: standard auto|ntsc|pal, or 'pal'/'ntsc')" ;;
                 esac
                 ;;
             log) [[ -f "$SCAN_LOG" ]] && tail -20 "$SCAN_LOG" || echo "[INFO] No log entries" ;;

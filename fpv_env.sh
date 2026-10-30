@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 
+# Locally built Pluto support (alongside Homebrew's existing SDR modules).
+for fpv_plugin_dir in "$HOME"/.local/pluto/lib/SoapySDR/modules*; do
+    [[ -d "$fpv_plugin_dir" ]] || continue
+    case ":${SOAPY_SDR_PLUGIN_PATH:-}:" in
+        *":$fpv_plugin_dir:"*) ;;
+        *) export SOAPY_SDR_PLUGIN_PATH="$fpv_plugin_dir${SOAPY_SDR_PLUGIN_PATH:+:$SOAPY_SDR_PLUGIN_PATH}" ;;
+    esac
+done
+unset fpv_plugin_dir
+
 resolve_fpv_python() {
     if [[ -n "$FPV_PYTHON" ]]; then
         PYTHON="$FPV_PYTHON"

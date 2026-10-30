@@ -39,6 +39,8 @@
 /*-----------------------MY LIBRARIES-------------------*/
 #include "NTSC_configuration.h"
 #include <stdio.h>
+#include <cstring>
+#include <algorithm>
 
 
 namespace gr {
@@ -56,7 +58,7 @@ namespace gr {
     video_stream_converter_c_impl::video_stream_converter_c_impl(float samp_rate, float decimation_factor, int width, int height)
       : gr::sync_decimator("video_stream_converter_c",
               gr::io_signature::make(4, 4, sizeof(float)),
-              gr::io_signature::make(1, 1, sizeof(short)), decimation_factor)
+              gr::io_signature::make(1, 1, sizeof(short)), std::max(1, int(decimation_factor)))
     {
       /*** INIT ***/
       d_decimation_factor = decimation_factor;
@@ -65,12 +67,15 @@ namespace gr {
       d_x_in = 0;
       d_y_in = 0;
       d_bw_in = 0;
+      d_last_input_y = -1;
       d_x_out = 0;
       d_y_out = 0;
 			for(int i = 0; i < d_w; i++){
 				for(int j = 0; j < d_h; j++)
 					d_img_mat[j][i] = 127;
 			}
+      std::memcpy(d_ready_mat, d_img_mat, sizeof(d_img_mat));
+      std::memcpy(d_display_mat, d_img_mat, sizeof(d_img_mat));
       printf("Welcome in NTSC Video Stream Converter C++ (%dx%d)\n", d_w, d_h);
     }
 
@@ -109,6 +114,15 @@ namespace gr {
           if(d_bw_in > 250) d_bw_in = 250;
           if(d_bw_in < 5) d_bw_in = 5;
 
+          // Publish after the last usable row, or at a field wrap.
+          // Some sources omit vertical sync; still show their first full field.
+          if (d_y_in >= 0) {
+            if ((d_y_in >= d_h - 2 && d_last_input_y >= 0 && d_last_input_y < d_h - 2) ||
+                (d_last_input_y > d_h / 2 && d_y_in < d_h / 4))
+              std::memcpy(d_ready_mat, d_img_mat, sizeof(d_img_mat));
+            d_last_input_y = d_y_in;
+          }
+
           // Inputs update image matrix
           if(d_x_in < d_w - 2 && d_x_in > 2  && d_y_in < d_h - 2 && d_y_in > 2 ){
             d_img_mat[d_y_in][d_x_in] = d_bw_in;
@@ -121,19 +135,17 @@ namespace gr {
       /*------------------------ OUTPUT -----------------------*/
       for(int i = 0; i < noutput_items; i++){
 
-        // Update position
-        d_x_out++;
-        if(d_x_out == d_w){
+        // Latch a completed field for the entire output raster. Never read
+        // the in-progress capture buffer while emitting a displayed frame.
+        if (d_x_out == 0 && d_y_out == 0)
+          std::memcpy(d_display_mat, d_ready_mat, sizeof(d_ready_mat));
+        out[i] = d_display_mat[d_y_out][d_x_out];
+        if (++d_x_out == d_w) {
           d_x_out = 0;
-          d_y_out++;
-        }
-        if(d_y_out == d_h){
-          d_y_out = 0;
+          if (++d_y_out == d_h)
+            d_y_out = 0;
         }
 
-        // Output correct pixel b&w level
-        if(d_x_out < d_w && d_x_out > -1 && d_y_out < d_h && d_y_out > -1 )
-          out[i] = d_img_mat[d_y_out][d_x_out];
       }
 
 

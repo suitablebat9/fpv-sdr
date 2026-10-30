@@ -178,7 +178,10 @@ def run_gnuradio():
             print("  [%s] FAIL too little output (%d cycles < 2)" % (name, cycles))
             ok = False
             continue
-        settled = rv[-(cycles - 1) * h:]
+        # Completed-field buffering intentionally adds acquisition latency.
+        # Check the last complete raster, excluding startup and a trailing
+        # partial raster, rather than averaging startup gray into the image.
+        settled = rv[(cycles - 1) * h:cycles * h]
         grad = align_cycle(settled, h)
         ok &= check_gradient(grad, name)
     return ok

@@ -11,10 +11,13 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from fpv_sdr import build_source, quad_demod_gain, UHD_ALIASES
+
 from gnuradio import gr, blocks, analog, filter
 from gnuradio.filter import firdes
 from gnuradio import fft as gr_fft
 from gnuradio.fft import window
+from fpv_autovideo import video_probe, receiver_agc
 
 try:
     import gnuradio.NTSC as NTSC
@@ -23,7 +26,6 @@ except Exception:
     NTSC = None
     HAVE_NTSC = False
 
-from fpv_sdr import build_source, quad_demod_gain, UHD_ALIASES
 import fpv_spectrum
 
 if hasattr(gr, 'logging') and hasattr(gr, 'log_levels'):
@@ -87,10 +89,23 @@ def chunk_plan(freqs, usable):
     return chunks
 
 
+def scan_candidates(rows, margin, peak_thresh, confirm):
+    """RF power ranks candidates; actual video sync decides in auto mode."""
+    ranked = sorted((r for r in rows if r[3] >= margin and
+                     (confirm == 'sync' or r[4] >= peak_thresh)), key=lambda r: -r[3])
+    seen = set()
+    result = []
+    for row in ranked:
+        if row[1] not in seen:
+            seen.add(row[1])
+            result.append(row)
+    return result
+
+
 class detector(gr.top_block):
     def __init__(self, sdr, samp_rate, gain, start_freq, dev_args, antenna,
                  loc_nfft=4096, loc_margin=6.0, lna=None, vga=None, amp=False,
-                 want_lock=True, standard='ntsc'):
+                 want_lock=True, standard='ntsc', want_video=False):
         gr.top_block.__init__(self, "FPV Detector", catch_exceptions=True)
         self.samp_rate = samp_rate
         self.is_hackrf = (str(sdr).lower() == 'hackrf')
@@ -99,6 +114,26 @@ class detector(gr.top_block):
         self.src, self._retune = build_source(
             samp_rate, start_freq, gain, sdr=sdr, dev_args=dev_args, antenna=antenna,
             lna=lna, vga=vga, amp=amp)
+
+        self.sdr = sdr
+        self.gain = gain
+        self.video_confirm = None
+        if want_video:
+            decimation = max(1, int(samp_rate/1e6))
+            analysis_rate = samp_rate/decimation
+            self.confirm_demod = analog.quadrature_demod_cf(quad_demod_gain(samp_rate))
+            self.confirm_filter = filter.fir_filter_fff(decimation, firdes.low_pass(
+                1., samp_rate, min(350e3, analysis_rate*.35),
+                min(100e3, analysis_rate*.1), window.WIN_HAMMING))
+            self.video_confirm = video_probe(analysis_rate)
+            # Match viewer acquisition: bypass DC blocker for UHD, use the
+            # short blocker for other radios (separate from the FFT branch).
+            if self.is_uhd:
+                self.connect(self.src, self.confirm_demod)
+            else:
+                self.confirm_dc = filter.dc_blocker_cc(32, False)
+                self.connect(self.src, self.confirm_dc, self.confirm_demod)
+            self.connect(self.confirm_demod, self.confirm_filter, self.video_confirm)
 
         pwr_win = max(1, int(samp_rate * 0.005))
         lock_win = max(1, int(samp_rate * 0.02))
@@ -152,6 +187,22 @@ class detector(gr.top_block):
             self.connect((self.dec, 1), self.null1)
             self.connect((self.dec, 2), self.null2)
             self.connect((self.dec, 3), self.null3)
+
+    def confirm_video(self, freq, settle):
+        self.retune(freq)
+        hardware_agc = receiver_agc(self.src, self.sdr)
+        try:
+            time.sleep(max(.15, settle))
+            return self.video_confirm.capture()
+        finally:
+            # Surveys compare fixed-gain power between channels.
+            if hardware_agc:
+                if self.is_uhd:
+                    self.src.set_rx_agc(False, 0)
+                    self.src.set_gain(self.gain, 0)
+                else:
+                    self.src.set_gain_mode(0, False)
+                    self.src.set_gain(0, float(self.gain))
 
     def retune(self, freq):
         self._retune(freq)
@@ -363,11 +414,9 @@ def main():
     ap.add_argument('--env-cv', type=float, default=0.8,
                     help='max envelope CV to accept as FPV. Measured on-air: real analog '
                          'FPV reads ~0.3-0.56, Wi-Fi/OFDM reads ~1.2-3.2; 0.8 sits in that gap')
-    ap.add_argument('--confirm', choices=('auto', 'cv', 'ntsc', 'snr'), default='auto',
-                    help='carrier confirm: auto (FM envelope-CV gate, plus NTSC sync-lock '
-                         'as an ADDITIVE second pass where the decoder is built — lock can '
-                         'only help accept, never reject); cv (force CV only); ntsc (force '
-                         'NTSC-lock only); snr (SNR+narrow-peak only, no carrier confirm)')
+    ap.add_argument('--confirm', choices=('auto', 'sync', 'cv', 'ntsc', 'snr'), default='auto',
+                    help='auto/sync: validate NTSC/PAL sync at each candidate frequency; '
+                         'cv: envelope variation; ntsc: legacy decoder lock; snr: RF power only')
     ap.add_argument('--usable-frac', type=float, default=0.8,
                     help='fraction of the sample rate kept per FFT chunk (drops rolled-off band edges)')
     ap.add_argument('--in-bw', type=float, default=10e6,
@@ -410,9 +459,8 @@ def main():
     ap.add_argument('--continuous', action='store_true')
     ap.add_argument('--stop-on-hit', action='store_true')
     ap.add_argument('--debug', action='store_true')
-    ap.add_argument('--standard', choices=('ntsc', 'pal'), default='ntsc',
-                    help='analog video standard for the NTSC-lock confirm path '
-                         '(ntsc default; pal = 625/50). Only affects --confirm ntsc.')
+    ap.add_argument('--standard', choices=('auto', 'ntsc', 'pal'), default='auto',
+                    help='auto accepts NTSC or PAL sync; ntsc/pal restricts accepted video to that standard')
     ap.add_argument('channels', nargs='+')
     args = ap.parse_args()
 
@@ -427,18 +475,19 @@ def main():
         sys.stderr.write("[detect] no valid channels\n")
         return 2
 
-    if not HAVE_NTSC and (args.sdr or '').lower() in UHD_ALIASES \
-            and args.confirm in ('auto', 'ntsc'):
-        sys.stderr.write(
-            "[detect] gnuradio.NTSC not built — UHD carrier confirm falls back to "
-            "SNR+narrow-peak only (build gr-ntsc-rc to enable NTSC sync-lock)\n")
-
+    if args.standard == 'auto' and args.confirm == 'ntsc':
+        sys.stderr.write('[detect] Auto standard: using NTSC/PAL sync confirmation.\n')
+        args.confirm = 'sync'
+    if args.confirm == 'ntsc' and not HAVE_NTSC:
+        sys.stderr.write('[detect] Legacy NTSC-lock confirmation requires the decoder; use --confirm sync instead.\n')
+        return 2
     want_lock = (not args.spectrum and not args.survey_only
                  and args.confirm == 'ntsc')
     tb = detector(args.sdr, args.samp_rate, args.gain,
                   chans[0][1], args.dev_args, args.antenna,
                   lna=args.lna, vga=args.vga, amp=args.amp,
-                  want_lock=want_lock, standard=args.standard)
+                  want_lock=want_lock, standard=args.standard,
+                  want_video=args.confirm in ('auto', 'sync') and not args.survey_only and not args.spectrum)
 
     def _clean_exit(sig=None, frame=None):
         tb.stop()
@@ -452,7 +501,7 @@ def main():
 
     confirm = args.confirm
     if confirm == 'auto':
-        confirm = 'cv'
+        confirm = 'sync'
 
     usable = args.samp_rate * args.usable_frac
     n_chunks = len(chunk_plan([f for _, f in chans], usable))
@@ -527,20 +576,38 @@ def main():
 
             sys.stderr.write(
                 "[detect] noise floor %.1f dBFS over %d FFT chunk(s); "
-                "SNR gate %.0f dB, peak gate %.0f dB\n"
-                % (floor_db, n_chunks, args.margin, args.peak_thresh))
+                "SNR gate %.0f dB, %s\n"
+                % (floor_db, n_chunks, args.margin,
+                   "video-sync confirmation" if confirm == "sync" else "peak gate %.0f dB" % args.peak_thresh))
 
             if args.survey_only:
                 rc = 0 if rows else 1
                 break
 
-            cands = [r for r in rows
-                     if r[3] >= args.margin and r[4] >= args.peak_thresh]
-            cands.sort(key=lambda r: -r[3])
+            cands = scan_candidates(rows, args.margin, args.peak_thresh, confirm)
             hit_names = {r[0] for r in cands}
 
             hit = None
-            for cand in cands[:3]:
+            for cand in cands:
+                if confirm == 'sync':
+                    # Validate the frequency we will actually hand to viewer.
+                    # Localizing to a nearby stronger interferer can hide FPV.
+                    name, freq = cand[:2]
+                    estimate = tb.confirm_video(freq, args.settle)
+                    ok = estimate is not None and (args.standard == 'auto' or
+                                                   estimate.standard == args.standard)
+                    detail = ('%s sync %.0f%%' % (estimate.standard.upper(), estimate.confidence*100)
+                              if estimate is not None else 'no reliable video sync')
+                    if estimate is not None and not ok:
+                        detail += ' (does not match forced %s)' % args.standard.upper()
+                    sys.stderr.write('[detect] candidate %s: %.3f MHz, SNR %.1f dB, %s -> %s\n' %
+                                     (name, freq/1e6, cand[3], detail, 'ACCEPT' if ok else 'REJECT'))
+                    if ok:
+                        print('HIT %s %.0f %.1f' % (name, freq, cand[3]), flush=True)
+                        rc = 0
+                        hit = (name, freq)
+                        break
+                    continue
                 seed = cand[1]
                 if args.localize_dwell > 0:
                     center = tb.localize_center(
@@ -590,6 +657,9 @@ def main():
                     hit = (name, freq)
                     break
 
+            # A completed sweep with no confirmed video is a valid empty
+            # result. Exceptions/device failures still exit nonzero.
+            rc = 0
             if hit is None:
                 if cands:
                     sys.stderr.write(

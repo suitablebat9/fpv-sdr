@@ -13,6 +13,9 @@ namespace gr {
      private:
        float d_decimation_factor;
        float d_img_mat[MAX_Y_HEIGHT + 20][MAX_X_WIDTH + 20];
+       float d_ready_mat[MAX_Y_HEIGHT + 20][MAX_X_WIDTH + 20];
+       float d_display_mat[MAX_Y_HEIGHT + 20][MAX_X_WIDTH + 20];
+       int d_last_input_y;
        int d_w;
        int d_h;
        int d_x_in;

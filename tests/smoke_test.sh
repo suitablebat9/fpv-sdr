@@ -77,7 +77,7 @@ fi
 CC_PY="${GR_PY:-$(command -v python3)}"
 if [[ -n "$CC_PY" ]]; then
     if "$CC_PY" -m py_compile \
-        fpv_detect.py fpv_viewer.py fpv_sdr.py fpv_spectrum.py fpv_display.py tools/fpv_tune.py 2>/tmp/fpv-sdr-pycompile.log; then
+        fpv_detect.py fpv_viewer.py fpv_sdr.py fpv_spectrum.py fpv_display.py fpv_video.py fpv_autovideo.py tools/fpv_tune.py 2>/tmp/fpv-sdr-pycompile.log; then
         pass "py_compile all modules ($CC_PY)"
     else
         fail "py_compile failed"; sed 's/^/      /' /tmp/fpv-sdr-pycompile.log
@@ -104,6 +104,14 @@ if [[ -n "$GR_PY" ]]; then
         pass "import gnuradio.NTSC (decoder installed)"
     else
         warn "gnuradio.NTSC not installed — run ./setup.sh"
+    fi
+    if have uhd_find_devices; then
+        if "$GR_PY" -c "from gnuradio import uhd" 2>/tmp/fpv-sdr-uhd-import.log; then
+            pass "gr-uhd imports with the installed UHD library"
+        else
+            fail "gr-uhd failed to load — GNU Radio/UHD installation is broken"
+            tail -5 /tmp/fpv-sdr-uhd-import.log | sed 's/^/      /'
+        fi
     fi
     "$GR_PY" -c "import gnuradio.soapy" 2>/dev/null && pass "gr-soapy present (HackRF/BladeRF path)" || warn "gr-soapy missing (needed for HackRF/BladeRF; UHD radios don't need it)"
 else
